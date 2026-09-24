@@ -55,7 +55,7 @@ GEMINI_API_KEY = os.getenv(
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.1-flash-lite"
+    "gemini-3.6-flash"
 )
 
 COLLECTION_NAME = "Qdrantdata"
