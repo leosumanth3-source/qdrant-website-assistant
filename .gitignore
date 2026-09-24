@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+.env
+
+.streamlit/secrets.toml
+
+data/raw/
+data/clean/
+data/chunks/
+data/embeddings/
