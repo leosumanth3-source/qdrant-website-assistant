@@ -115,22 +115,176 @@
     textarea.addEventListener("keydown",event=>{if(event.key==="Enter"&&!event.shiftKey){event.preventDefault();form.requestSubmit();}});
     document.querySelectorAll(".suggestion").forEach(button=>button.addEventListener("click",()=>{textarea.value=button.dataset.question||"";charCount.textContent=textarea.value.length;resizeTextarea();textarea.focus();}));
 
-    form.addEventListener("submit",async event=>{
-      event.preventDefault();
-      const question=textarea.value.trim();
-      if(!question||sendBtn.disabled) return;
-      addMessage("user",question); textarea.value=""; charCount.textContent="0"; resizeTextarea();
-      sendBtn.disabled=true; addTyping();
-      try{
-        const response=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question})});
-        let data=null; try{data=await response.json();}catch(_){data=null;}
-        removeTyping();
-        if(!response.ok) throw new Error(data?.detail||"The assistant could not process your request.");
-        addMessage("assistant",data?.answer||"I couldn't find an answer.",data?.sources||[]);
-      }catch(error){
-        removeTyping(); addMessage("assistant",error?.message||"Something went wrong while contacting the backend.",[],true);
-      }finally{sendBtn.disabled=false;textarea.focus();}
+    async function consumeStream(response, assistantBubble, bubbleWrap) {
+      if (!response.body) {
+        throw new Error("Streaming is not supported by this browser.");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+
+          let event;
+          try {
+            event = JSON.parse(line);
+          } catch (_) {
+            continue;
+          }
+
+          if (event.type === "sources") {
+            renderSources(bubbleWrap, event.sources || []);
+          } else if (event.type === "token") {
+            assistantBubble.dataset.streamingPlaceholder = "false";
+            assistantBubble.textContent += event.text || "";
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+          } else if (event.type === "error") {
+            throw new Error(event.message || "The assistant could not answer.");
+          }
+        }
+      }
+
+      const finalLine = buffer.trim();
+      if (finalLine) {
+        try {
+          const event = JSON.parse(finalLine);
+          if (event.type === "error") {
+            throw new Error(event.message || "The assistant could not answer.");
+          }
+        } catch (error) {
+          if (error instanceof Error && error.message !== finalLine) {
+            throw error;
+          }
+        }
+      }
+    }
+
+    function renderSources(bubbleWrap, sources) {
+      bubbleWrap.querySelector(".sources")?.remove();
+      if (!Array.isArray(sources) || !sources.length) return;
+
+      const sourcesEl = document.createElement("div");
+      sourcesEl.className = "sources";
+      sourcesEl.innerHTML = sources.slice(0, 3).map((source, index) => {
+        const title = source.title || "Qdrant source";
+        const url = source.url || "#";
+
+        return `
+          <a class="source-card"
+             href="${escapeHtml(url)}"
+             target="_blank"
+             rel="noopener noreferrer">
+            <div class="source-label">Source ${index + 1}</div>
+            <div class="source-title">${escapeHtml(title)}</div>
+            <div class="source-url">${escapeHtml(url)}</div>
+          </a>
+        `;
+      }).join("");
+
+      bubbleWrap.appendChild(sourcesEl);
+    }
+
+    function createStreamingAssistantMessage() {
+      if (emptyState) emptyState.remove();
+
+      const message = document.createElement("div");
+      message.className = "message assistant";
+      message.innerHTML = `
+        <div class="avatar">Q</div>
+        <div class="bubble-wrap">
+          <div class="bubble" data-streaming-placeholder="true"></div>
+        </div>
+      `;
+
+      messagesEl.appendChild(message);
+
+      return {
+        bubble: message.querySelector(".bubble"),
+        bubbleWrap: message.querySelector(".bubble-wrap")
+      };
+    }
+
+    form.addEventListener("submit", async event => {
+        event.preventDefault();
+
+        const question = textarea.value.trim();
+
+        if (!question || sendBtn.disabled) {
+            return;
+        }
+
+        addMessage("user", question);
+
+        textarea.value = "";
+        charCount.textContent = "0";
+        resizeTextarea();
+
+        sendBtn.disabled = true;
+        addTyping();
+
+        try {
+            const response = await fetch("/ask", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            body: JSON.stringify({
+                question: question
+            })
+            });
+
+            let data;
+
+            try {
+            data = await response.json();
+            } catch (_) {
+            throw new Error("Invalid response from backend.");
+            }
+
+            removeTyping();
+
+            if (!response.ok) {
+            throw new Error(
+                data?.detail ||
+                "The assistant could not process your request."
+            );
+            }
+
+            addMessage(
+            "assistant",
+            data?.answer || "I couldn't find an answer.",
+            data?.sources || [],
+            false,
+            data?.timing || null
+            );
+
+        } catch (error) {
+            removeTyping();
+
+            addMessage(
+            "assistant",
+            error?.message ||
+                "Something went wrong while contacting the backend.",
+            [],
+            true
+            );
+        } finally {
+            sendBtn.disabled = false;
+            textarea.focus();
+        }
     });
+
     resizeTextarea();
   </script>
 </body>

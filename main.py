@@ -1,14 +1,16 @@
+import json
 import math
 import os
 import re
 import time
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from qdrant_client import QdrantClient
@@ -53,7 +55,7 @@ GEMINI_API_KEY = os.getenv(
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.5-flash-lite"
+    "gemini-3.1-flash-lite"
 )
 
 COLLECTION_NAME = "Qdrantdata"
@@ -71,13 +73,13 @@ RERANKER_MODEL = (
 # RETRIEVAL SETTINGS
 # ============================================================
 
-INITIAL_TOP_K = 15
+INITIAL_TOP_K = 8
 
 FINAL_TOP_K = 3
 
-MAX_CONTEXT_CHARS = 4000
+MAX_CONTEXT_CHARS = 3000
 
-MAX_OUTPUT_TOKENS = 220
+MAX_OUTPUT_TOKENS = 180
 
 THINKING_LEVEL = "minimal"
 
@@ -106,11 +108,6 @@ if not GEMINI_API_KEY:
 # FASTAPI
 # ============================================================
 
-app = FastAPI(
-    title="Qdrant Website Assistant API",
-    description="RAG backend for the Qdrant website",
-    version="8.0.0"
-)
 
 
 # ============================================================
@@ -763,7 +760,8 @@ def load_qdrant():
     client = QdrantClient(
         url=QDRANT_URL,
         api_key=QDRANT_API_KEY,
-        timeout=60,
+        timeout=30,
+        prefer_grpc=True,
     )
 
     print(
@@ -793,6 +791,55 @@ def load_gemini():
     )
 
     return client
+
+
+# ============================================================
+# STARTUP RESOURCE PRELOAD
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    print("\n" + "=" * 90)
+    print("STARTING QDRANT WEBSITE ASSISTANT")
+    print("=" * 90)
+
+    startup_start = time.perf_counter()
+
+    try:
+
+        print("\nPreloading embedding model...")
+        load_embedding_model()
+
+        print("\nPreloading reranker...")
+        load_reranker()
+
+        print("\nConnecting to Qdrant Cloud...")
+        load_qdrant()
+
+        print("\nInitializing Gemini...")
+        load_gemini()
+
+        startup_time = time.perf_counter() - startup_start
+
+        print(
+            f"\nStartup resources ready in "
+            f"{startup_time:.3f}s"
+        )
+        print("=" * 90)
+
+        yield
+
+    finally:
+        print("\nApplication shutdown complete.")
+
+
+app = FastAPI(
+    title="Qdrant Website Assistant API",
+    description="RAG backend for the Qdrant website",
+    version="8.1.0",
+    lifespan=lifespan
+)
 
 
 # ============================================================
@@ -855,8 +902,14 @@ def retrieve(
             query=
                 query_vector,
 
-            with_payload=
-                True,
+            with_payload=[
+                "chunk_id",
+                "title",
+                "page_type",
+                "section",
+                "text",
+                "url",
+            ],
 
             limit=
                 INITIAL_TOP_K
@@ -1006,6 +1059,7 @@ def retrieve(
         rerank_scores = (
             reranker.predict(
                 candidate_pairs,
+                batch_size=8,
                 show_progress_bar=False
             )
         )
@@ -1225,7 +1279,7 @@ def retrieve(
     )
 
     for index, item in enumerate(
-        candidate_data[:8],
+        candidate_data[:5],
         start=1
     ):
 
@@ -1316,15 +1370,12 @@ The Qdrant website content in the knowledge base does not contain enough informa
 # GEMINI GENERATION
 # ============================================================
 
-def generate_answer(
+def build_user_content(
     question: str,
     context: str
 ) -> str:
 
-    gemini = load_gemini()
-
-
-    user_content = (
+    return (
         "Question:\n"
         + question
         + "\n\n"
@@ -1333,59 +1384,134 @@ def generate_answer(
     )
 
 
+def build_gemini_config():
+    return types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        thinking_config=types.ThinkingConfig(
+            thinking_level=THINKING_LEVEL
+        )
+    )
+
+def generate_answer(
+    question: str,
+    context: str
+) -> str:
+
+    gemini = load_gemini()
+
+    user_content = build_user_content(
+        question,
+        context
+    )
+
+    primary_model = GEMINI_MODEL
+
+    fallback_model = os.getenv(
+        "GEMINI_FALLBACK_MODEL",
+        "gemini-3.6-flash"
+    )
+
+    models_to_try = [
+        primary_model,
+        fallback_model
+    ]
+
+    last_error = None
+
+    for model in models_to_try:
+
+        for attempt in range(2):
+
+            try:
+
+                print(
+                    f"Trying Gemini model: {model} "
+                    f"(attempt {attempt + 1}/2)"
+                )
+
+                response = (
+                    gemini.models.generate_content(
+                        model=model,
+                        contents=user_content,
+                        config=build_gemini_config()
+                    )
+                )
+
+                answer = getattr(
+                    response,
+                    "text",
+                    None
+                )
+
+                if not answer:
+                    raise RuntimeError(
+                        "Gemini returned an empty response."
+                    )
+
+                print(
+                    f"Gemini success with model: {model}"
+                )
+
+                return answer.strip()
+
+            except Exception as error:
+
+                last_error = error
+
+                print(
+                    f"Gemini failed with {model}: "
+                    f"{error}"
+                )
+
+                error_text = str(error).lower()
+
+                # Retry temporary service errors.
+                if (
+                    "503" in error_text
+                    or "unavailable" in error_text
+                    or "high demand" in error_text
+                ):
+
+                    if attempt == 0:
+                        time.sleep(1)
+                        continue
+
+                # Move to fallback model.
+                break
+
+    raise RuntimeError(
+        "Gemini request failed with all configured models: "
+        f"{last_error}"
+    )
+
+
+def stream_answer(
+    question: str,
+    context: str
+):
+
+    gemini = load_gemini()
+
+    user_content = build_user_content(
+        question,
+        context
+    )
+
     try:
 
-        response = (
-            gemini.models.generate_content(
-
-                model=
-                    GEMINI_MODEL,
-
-                contents=
-                    user_content,
-
-                config=
-                    types.GenerateContentConfig(
-
-                        system_instruction=
-                            SYSTEM_INSTRUCTION,
-
-                        max_output_tokens=
-                            MAX_OUTPUT_TOKENS,
-
-                        thinking_config=
-                            types.ThinkingConfig(
-
-                                thinking_level=
-                                    THINKING_LEVEL
-                            )
-                    )
-            )
+        return gemini.models.generate_content_stream(
+            model=GEMINI_MODEL,
+            contents=user_content,
+            config=build_gemini_config()
         )
 
     except Exception as error:
 
         raise RuntimeError(
-            "Gemini request failed: "
+            "Gemini streaming request failed: "
             f"{error}"
         )
-
-
-    answer = getattr(
-        response,
-        "text",
-        None
-    )
-
-
-    if not answer:
-
-        raise RuntimeError(
-            "Gemini returned an empty response."
-        )
-
-
-    return answer.strip()
 
 
 # ============================================================
@@ -1562,7 +1688,40 @@ def health():
 
 
 # ============================================================
-# ASK
+# ASK HELPERS
+# ============================================================
+
+INSUFFICIENT_CONTENT_MESSAGE = (
+    "The Qdrant website content in the knowledge base does not contain "
+    "enough information to answer this question."
+)
+
+
+def prepare_retrieval(
+    request: Question
+):
+    question = request.question.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty."
+        )
+
+    retrieval = retrieve(question)
+
+    return question, retrieval
+
+
+def json_line(payload: dict[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False
+    ) + "\n"
+
+
+# ============================================================
+# ASK - NORMAL JSON RESPONSE
 # ============================================================
 
 @app.post("/ask")
@@ -1570,306 +1729,195 @@ def ask(
     request: Question
 ):
 
-    request_start = (
-        time.perf_counter()
-    )
-
-
-    question = (
-        request.question
-        .strip()
-    )
-
-
-    # ========================================================
-    # VALIDATE
-    # ========================================================
-
-    if not question:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Question cannot be empty."
-            )
-        )
-
-
-    print("\n" + "=" * 90)
-
-    print(
-        "QUESTION:"
-    )
-
-    print(
-        question
-    )
-
-    print("=" * 90)
-
-
-    # ========================================================
-    # RETRIEVAL
-    # ========================================================
+    request_start = time.perf_counter()
 
     try:
-
-        retrieval = retrieve(
-            question
-        )
-
+        question, retrieval = prepare_retrieval(request)
+    except HTTPException:
+        raise
     except Exception as error:
+        print("\nRETRIEVAL ERROR:", error)
+        raise HTTPException(status_code=500, detail=str(error))
 
-        print(
-            "\nRETRIEVAL ERROR:",
-            error
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(error)
-        )
-
-
-    final_results = retrieval[
-        "results"
-    ]
-
-
-    # ========================================================
-    # NO RELEVANT RESULTS
-    # ========================================================
+    final_results = retrieval["results"]
 
     if not final_results:
-
-        total_time = (
-            time.perf_counter()
-            - request_start
-        )
-
-
+        total_time = time.perf_counter() - request_start
         return {
-
-            "question":
-                question,
-
-            "answer": (
-                "The Qdrant website content in the "
-                "knowledge base does not contain enough "
-                "information to answer this question."
-            ),
-
-            "retrieved_chunks":
-                0,
-
-            "model_used":
-                None,
-
-            "sources":
-                [],
-
+            "question": question,
+            "answer": INSUFFICIENT_CONTENT_MESSAGE,
+            "retrieved_chunks": 0,
+            "model_used": None,
+            "sources": [],
             "timing": {
-
-                "embedding_seconds":
-                    round(
-                        retrieval[
-                            "embedding_time"
-                        ],
-                        3
-                    ),
-
-                "qdrant_seconds":
-                    round(
-                        retrieval[
-                            "qdrant_time"
-                        ],
-                        3
-                    ),
-
-                "reranker_seconds":
-                    round(
-                        retrieval[
-                            "rerank_time"
-                        ],
-                        3
-                    ),
-
-                "gemini_seconds":
-                    0.0,
-
-                "total_seconds":
-                    round(
-                        total_time,
-                        3
-                    ),
-
-                "context_characters":
-                    0
+                "embedding_seconds": round(retrieval["embedding_time"], 3),
+                "qdrant_seconds": round(retrieval["qdrant_time"], 3),
+                "reranker_seconds": round(retrieval["rerank_time"], 3),
+                "gemini_seconds": 0.0,
+                "total_seconds": round(total_time, 3),
+                "context_characters": 0
             }
         }
 
+    context, sources = build_context(final_results)
+    print(f"Context sent to Gemini: {len(context)} characters")
 
-    # ========================================================
-    # BUILD CONTEXT
-    # ========================================================
-
-    context, sources = (
-        build_context(
-            final_results
-        )
-    )
-
-
-    print(
-        f"Context sent to Gemini: "
-        f"{len(context)} characters"
-    )
-
-
-    # ========================================================
-    # GEMINI
-    # ========================================================
-
-    gemini_start = (
-        time.perf_counter()
-    )
-
+    gemini_start = time.perf_counter()
 
     try:
-
-        answer = generate_answer(
-            question,
-            context
-        )
-
+        answer = generate_answer(question, context)
     except Exception as error:
+        gemini_time = time.perf_counter() - gemini_start
+        print("\nGEMINI ERROR:", error)
+        raise HTTPException(status_code=500, detail=str(error))
 
-        gemini_time = (
-            time.perf_counter()
-            - gemini_start
-        )
+    gemini_time = time.perf_counter() - gemini_start
+    total_time = time.perf_counter() - request_start
 
-
-        print(
-            "\nGEMINI ERROR:",
-            error
-        )
-
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(error)
-        )
-
-
-    gemini_time = (
-        time.perf_counter()
-        - gemini_start
-    )
-
-
-    # ========================================================
-    # TOTAL
-    # ========================================================
-
-    total_time = (
-        time.perf_counter()
-        - request_start
-    )
-
-
-    # ========================================================
-    # LOGGING
-    # ========================================================
-
-    print(
-        f"Embedding time: "
-        f"{retrieval['embedding_time']:.3f}s"
-    )
-
-    print(
-        f"Qdrant time: "
-        f"{retrieval['qdrant_time']:.3f}s"
-    )
-
-    print(
-        f"Reranker time: "
-        f"{retrieval['rerank_time']:.3f}s"
-    )
-
-    print(
-        f"Gemini time: "
-        f"{gemini_time:.3f}s"
-    )
-
-    print(
-        f"Total time: "
-        f"{total_time:.3f}s"
-    )
-
+    print(f"Embedding time: {retrieval['embedding_time']:.3f}s")
+    print(f"Qdrant time: {retrieval['qdrant_time']:.3f}s")
+    print(f"Reranker time: {retrieval['rerank_time']:.3f}s")
+    print(f"Gemini time: {gemini_time:.3f}s")
+    print(f"Total time: {total_time:.3f}s")
     print("=" * 90)
 
-
-    # ========================================================
-    # RESPONSE
-    # ========================================================
-
     return {
-
-        "question":
-            question,
-
-        "answer":
-            answer,
-
-        "retrieved_chunks":
-            len(final_results),
-
-        "model_used":
-            GEMINI_MODEL,
-
-        "sources":
-            sources,
-
+        "question": question,
+        "answer": answer,
+        "retrieved_chunks": len(final_results),
+        "model_used": GEMINI_MODEL,
+        "sources": sources,
         "timing": {
-
-            "embedding_seconds":
-                round(
-                    retrieval[
-                        "embedding_time"
-                    ],
-                    3
-                ),
-
-            "qdrant_seconds":
-                round(
-                    retrieval[
-                        "qdrant_time"
-                    ],
-                    3
-                ),
-
-            "reranker_seconds":
-                round(
-                    retrieval[
-                        "rerank_time"
-                    ],
-                    3
-                ),
-
-            "gemini_seconds":
-                round(
-                    gemini_time,
-                    3
-                ),
-
-            "total_seconds":
-                round(
-                    total_time,
-                    3
-                ),
-
-            "context_characters":
-                len(context)
+            "embedding_seconds": round(retrieval["embedding_time"], 3),
+            "qdrant_seconds": round(retrieval["qdrant_time"], 3),
+            "reranker_seconds": round(retrieval["rerank_time"], 3),
+            "gemini_seconds": round(gemini_time, 3),
+            "total_seconds": round(total_time, 3),
+            "context_characters": len(context)
         }
     }
+
+
+# ============================================================
+# ASK/STREAM - NDJSON STREAMING RESPONSE
+# ============================================================
+
+@app.post("/ask/stream")
+def ask_stream(
+    request: Question
+):
+
+    def event_generator():
+
+        request_start = time.perf_counter()
+
+        try:
+            question, retrieval = prepare_retrieval(request)
+        except HTTPException as error:
+            yield json_line({
+                "type": "error",
+                "message": error.detail
+            })
+            return
+        except Exception as error:
+            print("\nRETRIEVAL ERROR:", error)
+            yield json_line({
+                "type": "error",
+                "message": str(error)
+            })
+            return
+
+        final_results = retrieval["results"]
+
+        if not final_results:
+            total_time = time.perf_counter() - request_start
+
+            yield json_line({
+                "type": "sources",
+                "sources": []
+            })
+
+            yield json_line({
+                "type": "token",
+                "text": INSUFFICIENT_CONTENT_MESSAGE
+            })
+
+            yield json_line({
+                "type": "done",
+                "model_used": None,
+                "timing": {
+                    "embedding_seconds": round(retrieval["embedding_time"], 3),
+                    "qdrant_seconds": round(retrieval["qdrant_time"], 3),
+                    "reranker_seconds": round(retrieval["rerank_time"], 3),
+                    "gemini_seconds": 0.0,
+                    "total_seconds": round(total_time, 3),
+                    "context_characters": 0
+                }
+            })
+            return
+
+        context, sources = build_context(final_results)
+        print(f"Context sent to Gemini: {len(context)} characters")
+
+        yield json_line({
+            "type": "sources",
+            "sources": sources
+        })
+
+        gemini_start = time.perf_counter()
+
+        try:
+            response_stream = stream_answer(question, context)
+
+            for chunk in response_stream:
+                chunk_text = getattr(chunk, "text", "") or ""
+
+                if not chunk_text:
+                    continue
+
+                yield json_line({
+                    "type": "token",
+                    "text": chunk_text
+                })
+
+        except Exception as error:
+            print("\nGEMINI STREAM ERROR:", error)
+            yield json_line({
+                "type": "error",
+                "message": str(error)
+            })
+            return
+
+        gemini_time = time.perf_counter() - gemini_start
+        total_time = time.perf_counter() - request_start
+
+        print(f"Embedding time: {retrieval['embedding_time']:.3f}s")
+        print(f"Qdrant time: {retrieval['qdrant_time']:.3f}s")
+        print(f"Reranker time: {retrieval['rerank_time']:.3f}s")
+        print(f"Gemini time: {gemini_time:.3f}s")
+        print(f"Total time: {total_time:.3f}s")
+        print("=" * 90)
+
+        yield json_line({
+            "type": "done",
+            "model_used": GEMINI_MODEL,
+            "retrieved_chunks": len(final_results),
+            "timing": {
+                "embedding_seconds": round(retrieval["embedding_time"], 3),
+                "qdrant_seconds": round(retrieval["qdrant_time"], 3),
+                "reranker_seconds": round(retrieval["rerank_time"], 3),
+                "gemini_seconds": round(gemini_time, 3),
+                "total_seconds": round(total_time, 3),
+                "context_characters": len(context)
+            }
+        })
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        }
+    )
