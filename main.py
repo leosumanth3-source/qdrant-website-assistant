@@ -2,22 +2,37 @@ import math
 import os
 import re
 import time
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
-import streamlit as st
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from google import genai
 from google.genai import types
 
 
 # ============================================================
-# ENVIRONMENT
+# LOAD ENVIRONMENT VARIABLES
 # ============================================================
 
 load_dotenv(override=True)
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+STATIC_DIR = BASE_DIR / "static"
+
+INDEX_FILE = STATIC_DIR / "index.html"
 
 
 # ============================================================
@@ -25,13 +40,11 @@ load_dotenv(override=True)
 # ============================================================
 
 QDRANT_URL = os.getenv(
-    "QDRANT_URL",
-    "http://localhost:6333"
+    "QDRANT_URL"
 )
 
 QDRANT_API_KEY = os.getenv(
-    "QDRANT_API_KEY",
-    "dummy"
+    "QDRANT_API_KEY"
 )
 
 GEMINI_API_KEY = os.getenv(
@@ -73,85 +86,39 @@ THINKING_LEVEL = "minimal"
 # VALIDATION
 # ============================================================
 
-if not GEMINI_API_KEY:
-    st.error(
-        "GEMINI_API_KEY is missing. "
-        "Add it to your .env file."
+if not QDRANT_URL:
+    raise RuntimeError(
+        "QDRANT_URL is not set in .env"
     )
-    st.stop()
+
+if not QDRANT_API_KEY:
+    raise RuntimeError(
+        "QDRANT_API_KEY is not set in .env"
+    )
+
+if not GEMINI_API_KEY:
+    raise RuntimeError(
+        "GEMINI_API_KEY is not set in .env"
+    )
 
 
 # ============================================================
-# PAGE CONFIG
+# FASTAPI
 # ============================================================
 
-st.set_page_config(
-    page_title="Qdrant Website Assistant",
-    page_icon="🔎",
-    layout="wide"
+app = FastAPI(
+    title="Qdrant Website Assistant API",
+    description="RAG backend for the Qdrant website",
+    version="8.0.0"
 )
 
 
 # ============================================================
-# CUSTOM CSS
+# REQUEST MODEL
 # ============================================================
 
-st.markdown(
-    """
-    <style>
-
-    .main-title {
-        font-size: 2.4rem;
-        font-weight: 700;
-        margin-bottom: 0.2rem;
-    }
-
-    .subtitle {
-        font-size: 1rem;
-        color: #666;
-        margin-bottom: 1.5rem;
-    }
-
-    .answer-box {
-        padding: 1.2rem;
-        border-radius: 12px;
-        border: 1px solid #ddd;
-        background-color: #fafafa;
-        margin-top: 1rem;
-        margin-bottom: 1rem;
-    }
-
-    .source-box {
-        padding: 0.8rem;
-        border-radius: 8px;
-        border: 1px solid #e3e3e3;
-        margin-bottom: 0.6rem;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.markdown(
-    '<div class="main-title">Qdrant Website Assistant</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    """
-    <div class="subtitle">
-    Ask questions about the publicly scraped Qdrant website.
-    Answers are grounded in the retrieved website content.
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+class Question(BaseModel):
+    question: str
 
 
 # ============================================================
@@ -221,7 +188,7 @@ def phrase_matches(
     question: str,
     title: str,
     section: str,
-    text: str
+    text: str,
 ) -> float:
 
     combined = (
@@ -229,6 +196,8 @@ def phrase_matches(
         f"{section} "
         f"{text}"
     ).lower()
+
+    question_lower = question.lower()
 
     important_phrases = [
         "free tier",
@@ -241,11 +210,11 @@ def phrase_matches(
         "semantic search",
         "sparse vectors",
         "dense vectors",
+        "qdrant pricing",
+        "features by tier",
     ]
 
     score = 0.0
-
-    question_lower = question.lower()
 
     for phrase in important_phrases:
 
@@ -265,19 +234,27 @@ def lexical_score(
     question: str,
     title: str,
     section: str,
-    text: str
+    text: str,
 ) -> float:
 
-    question_words = tokenize(question)
+    question_words = tokenize(
+        question
+    )
 
     if not question_words:
         return 0.0
 
-    title_words = tokenize(title)
+    title_words = tokenize(
+        title
+    )
 
-    section_words = tokenize(section)
+    section_words = tokenize(
+        section
+    )
 
-    text_words = tokenize(text)
+    text_words = tokenize(
+        text
+    )
 
     title_overlap = len(
         question_words & title_words
@@ -306,7 +283,10 @@ def lexical_score(
     )
 
     return min(
-        score / max(len(question_words), 1),
+        score / max(
+            len(question_words),
+            1
+        ),
         1.0
     )
 
@@ -321,7 +301,7 @@ def intent_score(
     section: str,
     page_type: str,
     url: str,
-    text: str
+    text: str,
 ) -> float:
 
     q = question.lower()
@@ -333,9 +313,10 @@ def intent_score(
 
     score = 0.0
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # PRICING
-    # --------------------------------------------------------
+    # ========================================================
 
     pricing_terms = {
         "price",
@@ -348,10 +329,15 @@ def intent_score(
         "premium",
         "standard",
         "cost",
-        "billing"
+        "billing",
     }
 
-    if any(term in q for term in pricing_terms):
+    is_pricing_query = any(
+        term in q
+        for term in pricing_terms
+    )
+
+    if is_pricing_query:
 
         if "/pricing" in u:
             score += 0.30
@@ -362,18 +348,31 @@ def intent_score(
         if "pricing" in s:
             score += 0.25
 
-        if "plan" in t or "plans" in t:
+        if (
+            "plan" in t
+            or "plans" in t
+        ):
             score += 0.18
 
-        if "tier" in t or "tiers" in t:
+        if (
+            "tier" in t
+            or "tiers" in t
+        ):
             score += 0.18
 
-        if "plan" in s or "plans" in s:
+        if (
+            "plan" in s
+            or "plans" in s
+        ):
             score += 0.15
 
-        if "tier" in s or "tiers" in s:
+        if (
+            "tier" in s
+            or "tiers" in s
+        ):
             score += 0.15
 
+        # Free
         if "free" in q:
 
             if "free" in t:
@@ -385,6 +384,7 @@ def intent_score(
             if "free tier" in body:
                 score += 0.15
 
+        # Premium
         if "premium" in q:
 
             if "premium" in t:
@@ -396,6 +396,7 @@ def intent_score(
             if "premium tier" in body:
                 score += 0.15
 
+        # Standard
         if "standard" in q:
 
             if "standard" in t:
@@ -416,9 +417,10 @@ def intent_score(
         if "billing" in s:
             score += 0.06
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # WHAT IS QDRANT?
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         "what is qdrant" in q
@@ -432,7 +434,7 @@ def intent_score(
                 "overview",
                 "introduction",
                 "vector search engine",
-                "what is qdrant"
+                "what is qdrant",
             ]
         ):
             score += 0.50
@@ -442,7 +444,7 @@ def intent_score(
             for phrase in [
                 "overview",
                 "introduction",
-                "what is qdrant"
+                "what is qdrant",
             ]
         ):
             score += 0.30
@@ -451,7 +453,7 @@ def intent_score(
             "documentation",
             "about",
             "homepage",
-            "website"
+            "website",
         }:
             score += 0.10
 
@@ -466,14 +468,15 @@ def intent_score(
                 "academy",
                 "certification",
                 "release",
-                "hybrid search"
+                "hybrid search",
             ]
         ):
             score -= 0.20
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # CAREERS
-    # --------------------------------------------------------
+    # ========================================================
 
     career_terms = [
         "career",
@@ -489,10 +492,13 @@ def intent_score(
         "open roles",
         "position",
         "positions",
-        "employment"
+        "employment",
     ]
 
-    if any(term in q for term in career_terms):
+    if any(
+        term in q
+        for term in career_terms
+    ):
 
         if p == "careers":
             score += 0.40
@@ -507,7 +513,7 @@ def intent_score(
                 "careers",
                 "jobs",
                 "join our team",
-                "about us"
+                "about us",
             ]
         ):
             score += 0.30
@@ -520,14 +526,15 @@ def intent_score(
                 "join",
                 "team",
                 "roles",
-                "leadership"
+                "leadership",
             ]
         ):
             score += 0.20
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # CLOUD
-    # --------------------------------------------------------
+    # ========================================================
 
     if "cloud" in q:
 
@@ -543,9 +550,10 @@ def intent_score(
         if "/cloud" in u:
             score += 0.15
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # HYBRID SEARCH
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         "hybrid search" in q
@@ -564,9 +572,10 @@ def intent_score(
         if "hybrid" in u:
             score += 0.10
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # TECHNICAL DOCUMENTATION
-    # --------------------------------------------------------
+    # ========================================================
 
     technical_words = [
         "collection",
@@ -584,7 +593,7 @@ def intent_score(
         "api",
         "client",
         "shard",
-        "shards"
+        "shards",
     ]
 
     if any(
@@ -595,24 +604,34 @@ def intent_score(
         if p == "documentation":
             score += 0.20
 
+
     return max(
         0.0,
-        min(score, 1.0)
+        min(
+            score,
+            1.0
+        )
     )
 
 
 # ============================================================
-# BUILD RERANKER TEXT
+# CANDIDATE TEXT
 # ============================================================
 
 def build_candidate_text(
-    payload: dict
+    payload: dict[str, Any]
 ) -> str:
 
     return (
-        f"Title: {payload.get('title', '')}\n"
-        f"Page type: {payload.get('page_type', '')}\n"
-        f"Section: {payload.get('section', '')}\n\n"
+        f"Title: "
+        f"{payload.get('title', '')}\n"
+
+        f"Page type: "
+        f"{payload.get('page_type', '')}\n"
+
+        f"Section: "
+        f"{payload.get('section', '')}\n\n"
+
         f"{payload.get('text', '')}"
     )
 
@@ -628,9 +647,13 @@ def minmax_normalize(
     if not values:
         return []
 
-    minimum = min(values)
+    minimum = min(
+        values
+    )
 
-    maximum = max(values)
+    maximum = max(
+        values
+    )
 
     if math.isclose(
         minimum,
@@ -649,7 +672,7 @@ def minmax_normalize(
 
 
 # ============================================================
-# LIMIT CONTEXT
+# CONTEXT LIMIT
 # ============================================================
 
 def limit_context(
@@ -657,7 +680,6 @@ def limit_context(
 ) -> str:
 
     if len(context) <= MAX_CONTEXT_CHARS:
-
         return context
 
     shortened = context[
@@ -676,131 +698,228 @@ def limit_context(
 
 
 # ============================================================
-# CACHED RESOURCES
+# LAZY LOAD EMBEDDING MODEL
 # ============================================================
 
-@st.cache_resource(
-    show_spinner="Loading embedding model..."
-)
+@lru_cache(maxsize=1)
 def load_embedding_model():
 
-    return SentenceTransformer(
+    from sentence_transformers import (
+        SentenceTransformer
+    )
+
+    print(
+        "\nLoading embedding model..."
+    )
+
+    model = SentenceTransformer(
         EMBEDDING_MODEL
     )
 
+    print(
+        "Embedding model loaded."
+    )
 
-@st.cache_resource(
-    show_spinner="Loading reranker..."
-)
+    return model
+
+
+# ============================================================
+# LAZY LOAD RERANKER
+# ============================================================
+
+@lru_cache(maxsize=1)
 def load_reranker():
 
-    return CrossEncoder(
+    from sentence_transformers import (
+        CrossEncoder
+    )
+
+    print(
+        "\nLoading reranker..."
+    )
+
+    model = CrossEncoder(
         RERANKER_MODEL
     )
 
+    print(
+        "Reranker loaded."
+    )
+
+    return model
 
 
-@st.cache_resource
+# ============================================================
+# QDRANT CLIENT
+# ============================================================
+
+@lru_cache(maxsize=1)
 def load_qdrant():
 
-    return QdrantClient(
+    print(
+        "\nConnecting to Qdrant Cloud..."
+    )
+
+    client = QdrantClient(
         url=QDRANT_URL,
         api_key=QDRANT_API_KEY,
         timeout=60,
     )
 
+    print(
+        "Qdrant client ready."
+    )
 
-@st.cache_resource
+    return client
+
+
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
+@lru_cache(maxsize=1)
 def load_gemini():
 
-    return genai.Client(
+    print(
+        "\nConnecting to Gemini..."
+    )
+
+    client = genai.Client(
         api_key=GEMINI_API_KEY
     )
 
+    print(
+        "Gemini client ready."
+    )
 
-# ============================================================
-# LOAD RESOURCES
-# ============================================================
-
-embedding_model = load_embedding_model()
-
-reranker = load_reranker()
-
-qdrant = load_qdrant()
-
-gemini = load_gemini()
+    return client
 
 
 # ============================================================
-# SEARCH FUNCTION
+# RETRIEVAL
 # ============================================================
 
 def retrieve(
     question: str
-):
+) -> dict[str, Any]:
 
-    # --------------------------------------------------------
+    retrieval_start = time.perf_counter()
+
+
+    # ========================================================
+    # LOAD RESOURCES LAZILY
+    # ========================================================
+
+    embedding_model = (
+        load_embedding_model()
+    )
+
+    reranker = load_reranker()
+
+    qdrant = load_qdrant()
+
+
+    # ========================================================
     # EMBEDDING
-    # --------------------------------------------------------
+    # ========================================================
 
     embedding_start = time.perf_counter()
+
 
     query_vector = embedding_model.encode(
         question,
         convert_to_numpy=True
     ).tolist()
 
+
     embedding_time = (
         time.perf_counter()
         - embedding_start
     )
 
-    # --------------------------------------------------------
-    # QDRANT
-    # --------------------------------------------------------
+
+    # ========================================================
+    # QDRANT SEARCH
+    # ========================================================
 
     qdrant_start = time.perf_counter()
 
-    results = qdrant.query_points(
 
-        collection_name=COLLECTION_NAME,
+    try:
 
-        query=query_vector,
+        results = qdrant.query_points(
 
-        with_payload=True,
+            collection_name=
+                COLLECTION_NAME,
 
-        limit=INITIAL_TOP_K
+            query=
+                query_vector,
 
-    ).points
+            with_payload=
+                True,
+
+            limit=
+                INITIAL_TOP_K
+        ).points
+
+    except Exception as error:
+
+        raise RuntimeError(
+            "Qdrant search failed: "
+            f"{error}"
+        )
+
 
     qdrant_time = (
         time.perf_counter()
         - qdrant_start
     )
 
+
+    # ========================================================
+    # NO RESULTS
+    # ========================================================
+
     if not results:
 
         return {
+
             "results": [],
-            "embedding_time": embedding_time,
-            "qdrant_time": qdrant_time,
-            "rerank_time": 0.0,
+
+            "embedding_time":
+                embedding_time,
+
+            "qdrant_time":
+                qdrant_time,
+
+            "rerank_time":
+                0.0,
+
+            "retrieval_time":
+                time.perf_counter()
+                - retrieval_start,
         }
 
-    # --------------------------------------------------------
-    # PREPARE CANDIDATES
-    # --------------------------------------------------------
+
+    # ========================================================
+    # PREPARE RERANKER INPUT
+    # ========================================================
 
     candidate_pairs = []
 
     candidate_data = []
+
 
     for dense_rank, result in enumerate(
         results,
         start=1
     ):
 
-        payload = result.payload or {}
+        payload = (
+            result.payload
+            or {}
+        )
+
 
         title = payload.get(
             "title",
@@ -827,6 +946,7 @@ def retrieve(
             ""
         )
 
+
         candidate_pairs.append(
             [
                 question,
@@ -835,6 +955,7 @@ def retrieve(
                 )
             ]
         )
+
 
         candidate_data.append({
 
@@ -872,70 +993,108 @@ def retrieve(
                 )
         })
 
-    # --------------------------------------------------------
-    # CROSS ENCODER
-    # --------------------------------------------------------
+
+    # ========================================================
+    # CROSS ENCODER RERANKING
+    # ========================================================
 
     rerank_start = time.perf_counter()
 
-    rerank_scores = reranker.predict(
-        candidate_pairs,
-        show_progress_bar=False
-    )
+
+    try:
+
+        rerank_scores = (
+            reranker.predict(
+                candidate_pairs,
+                show_progress_bar=False
+            )
+        )
+
+    except Exception as error:
+
+        raise RuntimeError(
+            "Reranking failed: "
+            f"{error}"
+        )
+
 
     rerank_time = (
         time.perf_counter()
         - rerank_start
     )
 
-    # --------------------------------------------------------
-    # RAW RERANK SCORES
-    # --------------------------------------------------------
+
+    # ========================================================
+    # STORE RERANK SCORES
+    # ========================================================
 
     for item, rerank_score in zip(
         candidate_data,
         rerank_scores
     ):
 
-        item["rerank_score"] = float(
-            rerank_score
+        item["rerank_score"] = (
+            float(
+                rerank_score
+            )
         )
 
-    # --------------------------------------------------------
-    # NORMALIZE
-    # --------------------------------------------------------
 
-    dense_normalized = minmax_normalize(
-        [
-            item["dense_score"]
-            for item in candidate_data
-        ]
+    # ========================================================
+    # NORMALIZE SIGNALS
+    # ========================================================
+
+    dense_normalized = (
+        minmax_normalize(
+            [
+                item["dense_score"]
+                for item in candidate_data
+            ]
+        )
     )
 
-    rerank_normalized = minmax_normalize(
-        [
-            item["rerank_score"]
-            for item in candidate_data
-        ]
+
+    rerank_normalized = (
+        minmax_normalize(
+            [
+                item["rerank_score"]
+                for item in candidate_data
+            ]
+        )
     )
 
-    lexical_normalized = minmax_normalize(
-        [
-            item["lexical_score"]
-            for item in candidate_data
-        ]
+
+    lexical_normalized = (
+        minmax_normalize(
+            [
+                item["lexical_score"]
+                for item in candidate_data
+            ]
+        )
     )
 
-    intent_normalized = minmax_normalize(
-        [
-            item["intent_score"]
-            for item in candidate_data
-        ]
+
+    intent_normalized = (
+        minmax_normalize(
+            [
+                item["intent_score"]
+                for item in candidate_data
+            ]
+        )
     )
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # HYBRID RANKING
-    # --------------------------------------------------------
+    # ========================================================
+    #
+    # CrossEncoder: 45%
+    # Dense:        20%
+    # Lexical:      15%
+    # Intent:       20%
+    #
+    # All values are normalized first.
+    # ========================================================
 
     for index, item in enumerate(
         candidate_data
@@ -956,6 +1115,7 @@ def retrieve(
         item["intent_normalized"] = (
             intent_normalized[index]
         )
+
 
         item["final_score"] = (
 
@@ -978,9 +1138,10 @@ def retrieve(
             * 0.20
         )
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # SORT
-    # --------------------------------------------------------
+    # ========================================================
 
     candidate_data.sort(
         key=lambda item:
@@ -988,46 +1149,58 @@ def retrieve(
         reverse=True
     )
 
-    # --------------------------------------------------------
-    # SELECT TOP RESULTS
-    # --------------------------------------------------------
+
+    # ========================================================
+    # FINAL RESULT SELECTION
+    # ========================================================
 
     final_results = []
 
     seen_chunk_ids = set()
 
-    seen_urls = {}
+    seen_urls: dict[str, int] = {}
+
 
     for item in candidate_data:
 
         if len(final_results) >= FINAL_TOP_K:
-
             break
+
 
         payload = item["payload"]
 
-        chunk_id = payload.get(
-            "chunk_id",
-            ""
+
+        chunk_id = str(
+            payload.get(
+                "chunk_id",
+                ""
+            )
         )
 
-        url = payload.get(
-            "url",
-            ""
+        url = str(
+            payload.get(
+                "url",
+                ""
+            )
         )
+
 
         if chunk_id in seen_chunk_ids:
-
             continue
 
-        page_count = seen_urls.get(
-            url,
-            0
+
+        page_count = (
+            seen_urls.get(
+                url,
+                0
+            )
         )
 
-        if page_count >= 2:
 
+        # Allow maximum two chunks from one page.
+        if page_count >= 2:
             continue
+
 
         seen_chunk_ids.add(
             chunk_id
@@ -1037,20 +1210,72 @@ def retrieve(
             page_count + 1
         )
 
+
         final_results.append(
             item
         )
 
+
+    # ========================================================
+    # DEBUG
+    # ========================================================
+
+    print(
+        "\nTOP RETRIEVAL RESULTS"
+    )
+
+    for index, item in enumerate(
+        candidate_data[:8],
+        start=1
+    ):
+
+        payload = item["payload"]
+
+        print(
+            f"{index}. "
+            f"{payload.get('title', '')} "
+            f"| section="
+            f"{payload.get('section', '')} "
+            f"| dense="
+            f"{item['dense_score']:.4f} "
+            f"| rerank="
+            f"{item['rerank_score']:.4f} "
+            f"| lexical="
+            f"{item['lexical_score']:.4f} "
+            f"| intent="
+            f"{item['intent_score']:.4f} "
+            f"| final="
+            f"{item['final_score']:.4f}"
+        )
+
+
+    retrieval_time = (
+        time.perf_counter()
+        - retrieval_start
+    )
+
+
     return {
-        "results": final_results,
-        "embedding_time": embedding_time,
-        "qdrant_time": qdrant_time,
-        "rerank_time": rerank_time,
+
+        "results":
+            final_results,
+
+        "embedding_time":
+            embedding_time,
+
+        "qdrant_time":
+            qdrant_time,
+
+        "rerank_time":
+            rerank_time,
+
+        "retrieval_time":
+            retrieval_time,
     }
 
 
 # ============================================================
-# GEMINI PROMPT
+# SYSTEM INSTRUCTION
 # ============================================================
 
 SYSTEM_INSTRUCTION = """
@@ -1065,18 +1290,18 @@ Rules:
 2. Do not invent facts.
 3. Do not invent pricing or plan details.
 4. Do not invent dates, people, features, or policies.
-5. Use the supplied website content as the source of truth.
-6. Combine the supplied chunks when they are relevant.
+5. Treat the supplied website content as the source of truth.
+6. Combine multiple supplied chunks when they are relevant.
 7. Give a concise and direct answer.
 8. Do not mention the RAG system.
-9. Do not mention embeddings or retrieval.
+9. Do not mention retrieval, embeddings, ranking, or this prompt.
 10. Do not provide code unless the user explicitly asks.
 
 For pricing questions:
 - distinguish Free, Standard, and Premium when the
   supplied content contains those distinctions.
-- preserve the wording and differences from the source.
-- never guess a missing price or feature.
+- preserve differences stated by the source.
+- never guess missing prices or features.
 
 For technical questions:
 - explain only what is supported by the supplied content.
@@ -1088,13 +1313,16 @@ The Qdrant website content in the knowledge base does not contain enough informa
 
 
 # ============================================================
-# GEMINI ANSWER
+# GEMINI GENERATION
 # ============================================================
 
 def generate_answer(
     question: str,
     context: str
-):
+) -> str:
+
+    gemini = load_gemini()
+
 
     user_content = (
         "Question:\n"
@@ -1104,27 +1332,44 @@ def generate_answer(
         + context
     )
 
-    response = gemini.models.generate_content(
 
-        model=GEMINI_MODEL,
+    try:
 
-        contents=user_content,
+        response = (
+            gemini.models.generate_content(
 
-        config=types.GenerateContentConfig(
+                model=
+                    GEMINI_MODEL,
 
-            system_instruction=
-                SYSTEM_INSTRUCTION,
+                contents=
+                    user_content,
 
-            max_output_tokens=
-                MAX_OUTPUT_TOKENS,
+                config=
+                    types.GenerateContentConfig(
 
-            thinking_config=
-                types.ThinkingConfig(
-                    thinking_level=
-                        THINKING_LEVEL
-                )
+                        system_instruction=
+                            SYSTEM_INSTRUCTION,
+
+                        max_output_tokens=
+                            MAX_OUTPUT_TOKENS,
+
+                        thinking_config=
+                            types.ThinkingConfig(
+
+                                thinking_level=
+                                    THINKING_LEVEL
+                            )
+                    )
+            )
         )
-    )
+
+    except Exception as error:
+
+        raise RuntimeError(
+            "Gemini request failed: "
+            f"{error}"
+        )
+
 
     answer = getattr(
         response,
@@ -1132,224 +1377,34 @@ def generate_answer(
         None
     )
 
+
     if not answer:
 
         raise RuntimeError(
             "Gemini returned an empty response."
         )
 
+
     return answer.strip()
 
 
 # ============================================================
-# SIDEBAR
+# BUILD CONTEXT
 # ============================================================
 
-with st.sidebar:
-
-    st.header("System")
-
-    st.write(
-        f"**Vector DB:** {COLLECTION_NAME}"
-    )
-
-    st.write(
-        f"**Embedding:** {EMBEDDING_MODEL}"
-    )
-
-    st.write(
-        f"**Reranker:** {RERANKER_MODEL}"
-    )
-
-    st.write(
-        f"**LLM:** {GEMINI_MODEL}"
-    )
-
-    st.divider()
-
-    st.write(
-        f"Initial retrieval: {INITIAL_TOP_K}"
-    )
-
-    st.write(
-        f"Final chunks: {FINAL_TOP_K}"
-    )
-
-    st.write(
-        f"Max context: {MAX_CONTEXT_CHARS} chars"
-    )
-
-    st.write(
-        f"Max output: {MAX_OUTPUT_TOKENS} tokens"
-    )
-
-    st.divider()
-
-    st.caption(
-        "Knowledge source: publicly scraped qdrant.tech content."
-    )
-
-
-# ============================================================
-# QUESTION INPUT
-# ============================================================
-
-question = st.text_area(
-    "Ask a question about Qdrant",
-    placeholder=(
-        "Example: Explain the free and premium plans"
-    ),
-    height=120
-)
-
-
-# ============================================================
-# ASK BUTTON
-# ============================================================
-
-ask_clicked = st.button(
-    "Ask Qdrant",
-    type="primary",
-    use_container_width=True
-)
-
-
-# ============================================================
-# PROCESS QUESTION
-# ============================================================
-
-if ask_clicked:
-
-    question = question.strip()
-
-    if not question:
-
-        st.warning(
-            "Please enter a question."
-        )
-
-        st.stop()
-
-
-    # ========================================================
-    # TOTAL TIMER
-    # ========================================================
-
-    total_start = time.perf_counter()
-
-
-    # ========================================================
-    # RETRIEVAL
-    # ========================================================
-
-    try:
-
-        with st.spinner(
-            "Searching Qdrant knowledge base..."
-        ):
-
-            retrieval = retrieve(
-                question
-            )
-
-    except Exception as error:
-
-        st.error(
-            f"Retrieval error: {error}"
-        )
-
-        st.stop()
-
-
-    final_results = retrieval[
-        "results"
-    ]
-
-
-    if not final_results:
-
-        st.warning(
-            "No relevant information was found."
-        )
-
-        st.stop()
-
-
-    # ========================================================
-    # DEBUG INFORMATION
-    # ========================================================
-
-    with st.expander(
-        "Retrieval details",
-        expanded=False
-    ):
-
-        st.write(
-            f"Candidates retrieved: "
-            f"{INITIAL_TOP_K}"
-        )
-
-        st.write(
-            f"Final chunks: "
-            f"{len(final_results)}"
-        )
-
-        st.write(
-            f"Embedding time: "
-            f"{retrieval['embedding_time']:.3f}s"
-        )
-
-        st.write(
-            f"Qdrant time: "
-            f"{retrieval['qdrant_time']:.3f}s"
-        )
-
-        st.write(
-            f"Reranker time: "
-            f"{retrieval['rerank_time']:.3f}s"
-        )
-
-
-        st.markdown(
-            "### Top retrieved chunks"
-        )
-
-
-        for index, item in enumerate(
-            final_results,
-            start=1
-        ):
-
-            payload = item["payload"]
-
-            st.write(
-                f"**{index}. "
-                f"{payload.get('title', '')}**"
-            )
-
-            st.write(
-                f"Section: "
-                f"{payload.get('section', '')}"
-            )
-
-            st.write(
-                f"Score: "
-                f"{item['final_score']:.4f}"
-            )
-
-
-    # ========================================================
-    # BUILD CONTEXT
-    # ========================================================
+def build_context(
+    results: list[dict[str, Any]]
+) -> tuple[str, list[dict[str, Any]]]:
 
     context_parts = []
 
     sources = []
 
 
-    for item in final_results:
+    for item in results:
 
         payload = item["payload"]
+
 
         title = payload.get(
             "title",
@@ -1408,8 +1463,10 @@ if ask_clicked:
         })
 
 
-    context = "\n\n---\n\n".join(
-        context_parts
+    context = (
+        "\n\n---\n\n".join(
+            context_parts
+        )
     )
 
 
@@ -1418,41 +1475,291 @@ if ask_clicked:
     )
 
 
-    # ========================================================
-    # CONTEXT SIZE
-    # ========================================================
+    return (
+        context,
+        sources
+    )
 
-    st.caption(
-        f"Context sent to Gemini: "
-        f"{len(context):,} characters"
+
+# ============================================================
+# HOME PAGE
+# ============================================================
+
+@app.get("/")
+def home():
+
+    if not INDEX_FILE.exists():
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "static/index.html "
+                "was not found."
+            )
+        )
+
+
+    return FileResponse(
+        INDEX_FILE
+    )
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    try:
+
+        qdrant = load_qdrant()
+
+
+        info = qdrant.get_collection(
+            collection_name=
+                COLLECTION_NAME
+        )
+
+
+        return {
+
+            "status":
+                "ok",
+
+            "collection":
+                COLLECTION_NAME,
+
+            "points":
+                info.points_count,
+
+            "embedding_model":
+                EMBEDDING_MODEL,
+
+            "reranker_model":
+                RERANKER_MODEL,
+
+            "gemini_model":
+                GEMINI_MODEL,
+
+            "initial_top_k":
+                INITIAL_TOP_K,
+
+            "final_top_k":
+                FINAL_TOP_K,
+
+            "max_context_chars":
+                MAX_CONTEXT_CHARS
+        }
+
+
+    except Exception as error:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
+
+
+# ============================================================
+# ASK
+# ============================================================
+
+@app.post("/ask")
+def ask(
+    request: Question
+):
+
+    request_start = (
+        time.perf_counter()
+    )
+
+
+    question = (
+        request.question
+        .strip()
     )
 
 
     # ========================================================
-    # GENERATE
+    # VALIDATE
     # ========================================================
 
-    gemini_start = time.perf_counter()
+    if not question:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Question cannot be empty."
+            )
+        )
+
+
+    print("\n" + "=" * 90)
+
+    print(
+        "QUESTION:"
+    )
+
+    print(
+        question
+    )
+
+    print("=" * 90)
+
+
+    # ========================================================
+    # RETRIEVAL
+    # ========================================================
+
+    try:
+
+        retrieval = retrieve(
+            question
+        )
+
+    except Exception as error:
+
+        print(
+            "\nRETRIEVAL ERROR:",
+            error
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
+
+
+    final_results = retrieval[
+        "results"
+    ]
+
+
+    # ========================================================
+    # NO RELEVANT RESULTS
+    # ========================================================
+
+    if not final_results:
+
+        total_time = (
+            time.perf_counter()
+            - request_start
+        )
+
+
+        return {
+
+            "question":
+                question,
+
+            "answer": (
+                "The Qdrant website content in the "
+                "knowledge base does not contain enough "
+                "information to answer this question."
+            ),
+
+            "retrieved_chunks":
+                0,
+
+            "model_used":
+                None,
+
+            "sources":
+                [],
+
+            "timing": {
+
+                "embedding_seconds":
+                    round(
+                        retrieval[
+                            "embedding_time"
+                        ],
+                        3
+                    ),
+
+                "qdrant_seconds":
+                    round(
+                        retrieval[
+                            "qdrant_time"
+                        ],
+                        3
+                    ),
+
+                "reranker_seconds":
+                    round(
+                        retrieval[
+                            "rerank_time"
+                        ],
+                        3
+                    ),
+
+                "gemini_seconds":
+                    0.0,
+
+                "total_seconds":
+                    round(
+                        total_time,
+                        3
+                    ),
+
+                "context_characters":
+                    0
+            }
+        }
+
+
+    # ========================================================
+    # BUILD CONTEXT
+    # ========================================================
+
+    context, sources = (
+        build_context(
+            final_results
+        )
+    )
+
+
+    print(
+        f"Context sent to Gemini: "
+        f"{len(context)} characters"
+    )
+
+
+    # ========================================================
+    # GEMINI
+    # ========================================================
+
+    gemini_start = (
+        time.perf_counter()
+    )
 
 
     try:
 
-        with st.spinner(
-            "Generating answer..."
-        ):
-
-            answer = generate_answer(
-                question,
-                context
-            )
+        answer = generate_answer(
+            question,
+            context
+        )
 
     except Exception as error:
 
-        st.error(
-            f"Gemini error: {error}"
+        gemini_time = (
+            time.perf_counter()
+            - gemini_start
         )
 
-        st.stop()
+
+        print(
+            "\nGEMINI ERROR:",
+            error
+        )
+
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
 
 
     gemini_time = (
@@ -1462,119 +1769,107 @@ if ask_clicked:
 
 
     # ========================================================
-    # TOTAL TIME
+    # TOTAL
     # ========================================================
 
     total_time = (
         time.perf_counter()
-        - total_start
+        - request_start
     )
 
 
     # ========================================================
-    # ANSWER
+    # LOGGING
     # ========================================================
 
-    st.markdown(
-        "## Answer"
+    print(
+        f"Embedding time: "
+        f"{retrieval['embedding_time']:.3f}s"
     )
 
-    st.markdown(
-        f"""
-        <div class="answer-box">
-        {answer}
-        </div>
-        """,
-        unsafe_allow_html=True
+    print(
+        f"Qdrant time: "
+        f"{retrieval['qdrant_time']:.3f}s"
     )
 
-
-    # ========================================================
-    # TIMING
-    # ========================================================
-
-    st.markdown(
-        "### Performance"
+    print(
+        f"Reranker time: "
+        f"{retrieval['rerank_time']:.3f}s"
     )
 
-
-    col1, col2, col3, col4 = st.columns(4)
-
-
-    with col1:
-
-        st.metric(
-            "Embedding",
-            f"{retrieval['embedding_time']:.3f}s"
-        )
-
-
-    with col2:
-
-        st.metric(
-            "Qdrant",
-            f"{retrieval['qdrant_time']:.3f}s"
-        )
-
-
-    with col3:
-
-        st.metric(
-            "Gemini",
-            f"{gemini_time:.3f}s"
-        )
-
-
-    with col4:
-
-        st.metric(
-            "Total",
-            f"{total_time:.3f}s"
-        )
-
-
-    # ========================================================
-    # SOURCES
-    # ========================================================
-
-    st.markdown(
-        "## Sources"
+    print(
+        f"Gemini time: "
+        f"{gemini_time:.3f}s"
     )
 
-
-    for index, source in enumerate(
-        sources,
-        start=1
-    ):
-
-        with st.expander(
-            f"{index}. {source['title']}"
-        ):
-
-            st.write(
-                f"**Section:** "
-                f"{source['section']}"
-            )
-
-            st.write(
-                f"**Page type:** "
-                f"{source['page_type']}"
-            )
-
-            st.write(
-                f"**Retrieval score:** "
-                f"{source['score']}"
-            )
-
-            st.markdown(
-                f"[Open source page]({source['url']})"
-            )
-
-
-    # ========================================================
-    # MODEL
-    # ========================================================
-
-    st.caption(
-        f"Answer generated by: {GEMINI_MODEL}"
+    print(
+        f"Total time: "
+        f"{total_time:.3f}s"
     )
+
+    print("=" * 90)
+
+
+    # ========================================================
+    # RESPONSE
+    # ========================================================
+
+    return {
+
+        "question":
+            question,
+
+        "answer":
+            answer,
+
+        "retrieved_chunks":
+            len(final_results),
+
+        "model_used":
+            GEMINI_MODEL,
+
+        "sources":
+            sources,
+
+        "timing": {
+
+            "embedding_seconds":
+                round(
+                    retrieval[
+                        "embedding_time"
+                    ],
+                    3
+                ),
+
+            "qdrant_seconds":
+                round(
+                    retrieval[
+                        "qdrant_time"
+                    ],
+                    3
+                ),
+
+            "reranker_seconds":
+                round(
+                    retrieval[
+                        "rerank_time"
+                    ],
+                    3
+                ),
+
+            "gemini_seconds":
+                round(
+                    gemini_time,
+                    3
+                ),
+
+            "total_seconds":
+                round(
+                    total_time,
+                    3
+                ),
+
+            "context_characters":
+                len(context)
+        }
+    }
