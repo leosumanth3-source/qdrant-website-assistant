@@ -73,7 +73,7 @@ RERANKER_MODEL = (
 # RETRIEVAL SETTINGS
 # ============================================================
 
-INITIAL_TOP_K = 8
+INITIAL_TOP_K = 20
 
 FINAL_TOP_K = 3
 
